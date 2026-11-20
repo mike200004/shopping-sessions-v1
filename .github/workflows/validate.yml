@@ -1,0 +1,74 @@
+name: validate
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BASE: https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+      IMAGE: shopping-sessions:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --platform linux/amd64 -t "$IMAGE" .
+      - name: Download organizer files
+        run: |
+          mkdir -p /tmp/org && cd /tmp/org
+          for f in generator dev-answer starter-duckdb; do
+            curl -fsSL -o $f.zip "$BASE/$f.zip"
+            mkdir $f && unzip -q $f.zip -d $f
+          done
+          find /tmp/org -maxdepth 3 | head -50
+      - name: Locate files
+        run: |
+          S=$(dirname "$(find /tmp/org/starter-duckdb -name docker_run.sh | head -1)")
+          echo "SCRIPTS=$S" >> $GITHUB_ENV
+          echo "FIXTURES=$(dirname "$(find /tmp/org/starter-duckdb -type d -name fixtures | head -1)")/fixtures" >> $GITHUB_ENV
+          G=$(find /tmp/org/generator -name Cargo.toml -not -path '*/target/*' | head -1)
+          echo "GENDIR=$(dirname "$G")" >> $GITHUB_ENV
+          A=$(dirname "$(find /tmp/org/dev-answer -name 'user_daily*' | head -1)")
+          echo "ANSWER=$A" >> $GITHUB_ENV
+      - name: Build generator
+        run: cd "$GENDIR" && cargo build --release && echo "GEN=$GENDIR/target/release/generate" >> $GITHUB_ENV
+      - name: Python deps
+        run: pip install polars
+      - name: Fixtures (36)
+        run: |
+          set -eo pipefail
+          chmod +x "$SCRIPTS/docker_run.sh"
+          CPUS=$(nproc) MEM=8g python3 "$SCRIPTS/run_fixtures.py" "$FIXTURES" -- "$SCRIPTS/docker_run.sh" | tee fx.log
+          grep -q "36/36 fixtures passed" fx.log
+      - name: Dev set, compare and time
+        run: |
+          set -eo pipefail
+          df -h /tmp
+          "$GEN" --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          export CPUS=$(nproc) MEM=12g
+          for i in 1 2 3; do
+            rm -rf /tmp/out-dev
+            s=$(date +%s.%N)
+            "$SCRIPTS/docker_run.sh" /tmp/dev /tmp/out-dev
+            e=$(date +%s.%N)
+            echo "dev run $i: $(echo "$e - $s" | bc) s (cpus=$CPUS)"
+          done
+          python3 "$SCRIPTS/compare.py" /tmp/out-dev "$ANSWER" | tee cmp.log
+          tail -1 cmp.log | grep -qx MATCH
+      - name: 20M-event timing
+        run: |
+          set -eo pipefail
+          df -h /tmp
+          "$GEN" --seed 42 --events 20000000 --clicks 5000000 --output /tmp/big
+          df -h /tmp
+          export CPUS=$(nproc) MEM=12g
+          for i in 1 2 3; do
+            rm -rf /tmp/out-big
+            s=$(date +%s.%N)
+            "$SCRIPTS/docker_run.sh" /tmp/big /tmp/out-big
+            e=$(date +%s.%N)
+            echo "20M run $i: $(echo "$e - $s" | bc) s (cpus=$CPUS)"
+          done
+          ls /tmp/out-big/user_daily/*.parquet >/dev/null
+          ls /tmp/out-big/campaign_daily/*.parquet >/dev/null
+          echo "20M outputs present"
